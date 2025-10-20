@@ -1,0 +1,22 @@
+[package]
+name = "cardano-evaluation-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+axum = { version = "0.7", features = ["json"] }
+blockfrost = "1.1.0"
+blockfrost-openapi = "0.1.75"
+cbor_event = "2.4.0"
+anyhow = "1.0"
+cml-core = { version = "6.2.0" }
+cml-crypto = { version = "6.2.0" }
+cml-chain = { version = "6.2.0" }
+hex = "0.4"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.37", features = ["macros", "rt-multi-thread", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+uplc = "1.1.17"
+thiserror = "1.0"

@@ -1,0 +1,7 @@
+/.direnv
+/target
+.idea
+_site/
+temp/
+scratch/
+.vscode/
