@@ -1,4 +1,9 @@
-use std::{collections::HashMap, env, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    env,
+    net::SocketAddr,
+    sync::Arc,
+};
 
 use axum::{
     extract::{FromRef, State},
@@ -9,22 +14,23 @@ use axum::{
 };
 
 use anyhow::{anyhow, Context};
+use blockfrost::{BlockfrostAPI, BlockfrostError};
+use blockfrost_openapi::models::{
+    epoch_param_content::EpochParamContent,
+    tx_content_utxo_outputs_inner::TxContentUtxoOutputsInner,
+};
 use cml_chain::{
     address::Address,
     assets::{AssetName, MultiAsset, Value as CmlValue},
     builders::output_builder::TransactionOutputBuilder,
-    plutus::{
-        CostModels, Language, PlutusData, PlutusV1Script, PlutusV2Script, PlutusV3Script,
-    },
-    transaction::{DatumOption, TransactionInput},
+    plutus::{CostModels, Language, PlutusData, PlutusV1Script, PlutusV2Script, PlutusV3Script},
+    transaction::{DatumOption, Transaction, TransactionInput},
     PolicyId, Script,
 };
 use cml_core::serialization::{
     Deserialize as CmlDeserialize, RawBytesEncoding, Serialize as CmlSerialize,
 };
 use cml_crypto::{DatumHash, TransactionHash};
-use blockfrost::BlockfrostAPI;
-use blockfrost_openapi::models::epoch_param_content::EpochParamContent;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use thiserror::Error;
@@ -166,6 +172,22 @@ enum AppError {
     },
     #[error("invalid additional utxo at index {index}: {message}")]
     InvalidAdditionalUtxo { index: usize, message: String },
+    #[error("failed to decode transaction CBOR: {0}")]
+    InvalidTransaction(String),
+    #[error("failed to fetch UTxO data for transaction {tx_id}: {source}")]
+    Blockfrost {
+        tx_id: String,
+        #[source]
+        source: BlockfrostError,
+    },
+    #[error("UTxO {tx_id}#{index} not found in Blockfrost response")]
+    MissingUtxo { tx_id: String, index: u32 },
+    #[error("invalid UTxO data for {tx_id}#{index}: {message}")]
+    InvalidFetchedUtxo {
+        tx_id: String,
+        index: u32,
+        message: String,
+    },
     #[error("transaction evaluation failed: {0}")]
     Evaluation(#[from] tx::error::Error),
 }
@@ -175,6 +197,10 @@ impl IntoResponse for AppError {
         let status = match self {
             AppError::InvalidHex { .. } => StatusCode::BAD_REQUEST,
             AppError::InvalidAdditionalUtxo { .. } => StatusCode::BAD_REQUEST,
+            AppError::InvalidTransaction(_) => StatusCode::BAD_REQUEST,
+            AppError::Blockfrost { .. } => StatusCode::BAD_GATEWAY,
+            AppError::MissingUtxo { .. } => StatusCode::BAD_REQUEST,
+            AppError::InvalidFetchedUtxo { .. } => StatusCode::BAD_REQUEST,
             AppError::Evaluation(_) => StatusCode::BAD_REQUEST,
         };
 
@@ -195,8 +221,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "0.0.0.0:3000".to_string())
         .parse()?;
 
-    let blockfrost_project_id = env::var("BLOCKFROST_API_KEY")
-        .context("BLOCKFROST_API_KEY env var must be set")?;
+    let blockfrost_project_id =
+        env::var("BLOCKFROST_API_KEY").context("BLOCKFROST_API_KEY env var must be set")?;
     let blockfrost_api = BlockfrostAPI::new(blockfrost_project_id.as_str(), Default::default());
 
     let protocol_parameters = match blockfrost_api.epochs_latest_parameters().await {
@@ -271,11 +297,84 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 async fn evaluate_transaction(
     State(state): State<AppState>,
-    State(_blockfrost_api): State<Arc<BlockfrostAPI>>,
-    Json(payload): Json<EvaluationRequest>,
+    State(blockfrost_api): State<Arc<BlockfrostAPI>>,
+    Json(mut payload): Json<EvaluationRequest>,
 ) -> Result<Json<EvaluationResponse>, AppError> {
-
     let tx_bytes = decode_hex("cbor", &payload.cbor)?;
+
+    let transaction = Transaction::from_cbor_bytes(&tx_bytes)
+        .map_err(|error| AppError::InvalidTransaction(error.to_string()))?;
+    let body = transaction.body;
+
+    let mut additional_utxo_refs = HashSet::new();
+    for (tx_in, _) in &payload.additional_utxo_set {
+        additional_utxo_refs.insert(utxo_ref_key(&tx_in.tx_id, tx_in.index));
+    }
+
+    let mut missing_by_hash: HashMap<String, HashSet<u32>> = HashMap::new();
+
+    for input in body.inputs.iter() {
+        let index = u32::try_from(input.index).map_err(|_| {
+            AppError::InvalidTransaction(format!(
+                "transaction input index {} exceeds u32 range",
+                input.index
+            ))
+        })?;
+        let tx_id = input.transaction_id.to_hex();
+        let key = utxo_ref_key(&tx_id, index);
+        if !additional_utxo_refs.contains(&key) {
+            missing_by_hash.entry(tx_id).or_default().insert(index);
+        }
+    }
+
+    if let Some(reference_inputs) = body.reference_inputs.as_ref() {
+        for input in reference_inputs.iter() {
+            let index = u32::try_from(input.index).map_err(|_| {
+                AppError::InvalidTransaction(format!(
+                    "reference input index {} exceeds u32 range",
+                    input.index
+                ))
+            })?;
+            let tx_id = input.transaction_id.to_hex();
+            let key = utxo_ref_key(&tx_id, index);
+            if !additional_utxo_refs.contains(&key) {
+                missing_by_hash.entry(tx_id).or_default().insert(index);
+            }
+        }
+    }
+
+    for (tx_id, indexes) in missing_by_hash {
+        let utxo_response = blockfrost_api
+            .transactions_utxos(&tx_id)
+            .await
+            .map_err(|source| AppError::Blockfrost {
+                tx_id: tx_id.clone(),
+                source,
+            })?;
+
+        let outputs_by_index: HashMap<u32, TxContentUtxoOutputsInner> = utxo_response
+            .outputs
+            .into_iter()
+            .map(|output| (output.output_index as u32, output))
+            .collect();
+
+        for index in indexes {
+            let output = outputs_by_index
+                .get(&index)
+                .ok_or_else(|| AppError::MissingUtxo {
+                    tx_id: tx_id.clone(),
+                    index,
+                })?;
+            let tx_out = blockfrost_output_to_tx_out(output, &tx_id, index)?;
+            payload.additional_utxo_set.push((
+                TxIn {
+                    tx_id: tx_id.clone(),
+                    index,
+                },
+                tx_out,
+            ));
+        }
+    }
 
     let utxos = additional_utxos_to_cbor(&payload.additional_utxo_set)?;
 
@@ -347,9 +446,76 @@ async fn evaluate_transaction(
     Ok(Json(EvaluationResponse { redeemers }))
 }
 
-fn additional_utxos_to_cbor(
-    utxos: &[(TxIn, TxOut)],
-) -> Result<Vec<(Vec<u8>, Vec<u8>)>, AppError> {
+fn utxo_ref_key(tx_id: &str, index: u32) -> String {
+    format!("{tx_id}#{index}")
+}
+
+fn blockfrost_output_to_tx_out(
+    output: &TxContentUtxoOutputsInner,
+    tx_id: &str,
+    index: u32,
+) -> Result<TxOut, AppError> {
+    let mut coins: Option<u64> = None;
+    let mut assets_map: HashMap<String, u64> = HashMap::new();
+
+    for amount in &output.amount {
+        let quantity =
+            amount
+                .quantity
+                .parse::<u64>()
+                .map_err(|error| AppError::InvalidFetchedUtxo {
+                    tx_id: tx_id.to_string(),
+                    index,
+                    message: format!(
+                        "failed to parse quantity `{}` for unit `{}`: {error}",
+                        amount.quantity, amount.unit
+                    ),
+                })?;
+
+        if amount.unit == "lovelace" {
+            coins = Some(quantity);
+        } else {
+            const POLICY_HEX_LEN: usize = 56;
+            if amount.unit.len() < POLICY_HEX_LEN {
+                return Err(AppError::InvalidFetchedUtxo {
+                    tx_id: tx_id.to_string(),
+                    index,
+                    message: format!(
+                        "asset unit `{}` shorter than expected policy id length",
+                        amount.unit
+                    ),
+                });
+            }
+            let (policy_hex, asset_name_hex) = amount.unit.split_at(POLICY_HEX_LEN);
+            let asset_key = format!("{policy_hex}.{}", asset_name_hex);
+            assets_map.insert(asset_key, quantity);
+        }
+    }
+
+    let value = ValueJson {
+        coins: coins.unwrap_or(0),
+        assets: if assets_map.is_empty() {
+            None
+        } else {
+            Some(assets_map)
+        },
+    };
+
+    let datum = output
+        .inline_datum
+        .as_ref()
+        .map(|datum| DatumField::Hex(datum.clone()));
+
+    Ok(TxOut {
+        address: output.address.clone(),
+        value,
+        datum_hash: output.data_hash.clone(),
+        datum,
+        script: None,
+    })
+}
+
+fn additional_utxos_to_cbor(utxos: &[(TxIn, TxOut)]) -> Result<Vec<(Vec<u8>, Vec<u8>)>, AppError> {
     utxos
         .iter()
         .enumerate()
